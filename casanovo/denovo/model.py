@@ -418,6 +418,75 @@ class Spec2Pep(pl.LightningModule):
         # the precursor m/z tolerance if possible.
         return list(self._get_top_peptide(pred_cache))
 
+    def decode_profiles(
+        self,
+        mzs: torch.Tensor,
+        intensities: torch.Tensor,
+        precursors: torch.Tensor,
+    ) -> List[np.ndarray]:
+        """
+        Greedy decoding returning per-position token probability profiles.
+
+        Performs a single greedy forward pass and returns the full softmax
+        distribution over the vocabulary at each decoding step, without
+        committing to a sequence path via beam search. Intended as the
+        first pass for MSA-based profile aggregation.
+
+        Parameters
+        ----------
+        mzs : torch.Tensor of shape (n_spectra, max_peaks)
+            The m/z values of the input spectra.
+        intensities : torch.Tensor of shape (n_spectra, max_peaks)
+            The intensity values of the input spectra.
+        precursors : torch.Tensor of shape (n_spectra, 3)
+            Precursor neutral mass, charge, and m/z for each spectrum.
+
+        Returns
+        -------
+        List[np.ndarray]
+            For each spectrum, a float32 array of shape
+            (peptide_length, vocab_size) with softmax probabilities at
+            each decoded position, excluding the stop token.
+        """
+        memories, mem_masks = self.encoder(mzs, intensities)
+        batch = mzs.shape[0]
+        device = self.device
+
+        tokens = torch.zeros(batch, 0, dtype=torch.int64, device=device)
+        finished = torch.zeros(batch, dtype=torch.bool, device=device)
+        step_probs = []
+
+        for _ in range(self.max_peptide_len):
+            logits = self.decoder(
+                tokens=tokens,
+                memory=memories,
+                memory_key_padding_mask=mem_masks,
+                precursors=precursors,
+            )
+            # logits: (batch, step+1, vocab) — take the last step only
+            probs = self.softmax(logits)[:, -1, :]  # (batch, vocab)
+            step_probs.append(probs.detach().cpu())
+
+            next_tokens = probs.argmax(dim=-1)  # (batch,)
+            tokens = torch.cat([tokens, next_tokens.unsqueeze(1)], dim=1)
+            finished |= next_tokens == self.stop_token
+            if finished.all():
+                break
+
+        # (batch, n_steps, vocab)
+        all_probs = torch.stack(step_probs, dim=1)
+        token_seq = tokens.cpu()
+
+        profiles = []
+        for b in range(batch):
+            stop_pos = (token_seq[b] == self.stop_token).nonzero()
+            length = (
+                stop_pos[0].item() if len(stop_pos) > 0 else token_seq.shape[1]
+            )
+            profiles.append(all_probs[b, :length, :].numpy())
+
+        return profiles
+
     def _finish_beams(
         self,
         tokens: torch.Tensor,

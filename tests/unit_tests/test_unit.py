@@ -2400,6 +2400,48 @@ class MiniTok:
         return mass / charges + 1.007276
 
 
+def test_decode_profiles():
+    """Test that decode_profiles returns valid per-position probability arrays."""
+    tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer()
+    model = Spec2Pep(
+        n_beams=1,
+        residues="massivekb",
+        min_peptide_len=1,
+        max_peptide_len=20,
+        tokenizer=tokenizer,
+    )
+    model.eval()
+
+    n_spectra = 2
+    n_peaks = 5
+    vocab = len(tokenizer) + 1
+
+    mzs = torch.zeros(n_spectra, n_peaks)
+    intensities = torch.zeros(n_spectra, n_peaks)
+    # precursors: [neutral_mass, charge, mz]
+    precursor_mz = 235.634
+    charge = 2.0
+    neutral_mass = (precursor_mz - 1.007276) * charge
+    precursors = torch.tensor(
+        [[neutral_mass, charge, precursor_mz]] * n_spectra
+    )
+
+    with torch.no_grad():
+        profiles = model.decode_profiles(mzs, intensities, precursors)
+
+    assert len(profiles) == n_spectra
+    for profile in profiles:
+        assert isinstance(profile, np.ndarray)
+        assert profile.ndim == 2
+        length, v = profile.shape
+        assert 1 <= length <= model.max_peptide_len
+        assert v == vocab
+        # Each position must be a valid probability distribution
+        assert np.all(profile >= 0)
+        assert np.all(profile <= 1)
+        np.testing.assert_allclose(profile.sum(axis=1), 1.0, atol=1e-5)
+
+
 def _build_model(tok, cls=Spec2Pep, ppm_tol=20):
     model = cls(
         tokenizer=tok,
