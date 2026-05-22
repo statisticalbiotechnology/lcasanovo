@@ -137,9 +137,12 @@ def log_system_info() -> None:
     logger.info("Casanovo Version: %s", __version__)
     logger.info("Depthcharge Version: %s", depthcharge.__version__)
     logger.info("PyTorch Version: %s", torch.__version__)
-    if torch.cuda.is_available():
-        logger.info("CUDA Version: %s", torch.version.cuda)
-        logger.info("cuDNN Version: %s", torch.backends.cudnn.version())
+    try:
+        if torch.cuda.is_available():
+            logger.info("CUDA Version: %s", torch.version.cuda)
+            logger.info("cuDNN Version: %s", torch.backends.cudnn.version())
+    except RuntimeError as e:
+        logger.warning("Could not query CUDA/cuDNN info: %s", e)
 
 
 def log_run_report(

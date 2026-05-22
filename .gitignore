@@ -92,3 +92,15 @@ target/
 
 # Mypy cache
 .mypy_cache/
+
+# Nextflow pipeline working files
+pipeline/work/
+pipeline/results/
+pipeline/.nextflow/
+pipeline/.nextflow.log*
+pipeline/.nextflow.pid
+pipeline/versions/
+pipeline/version?current*
+
+# Test spectrum output directories
+test_spectrum*/
