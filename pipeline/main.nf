@@ -151,7 +151,7 @@ process CASANOVO_LCASANOVO {
     def model_arg  = params.model  ? "--model '${params.model}'"   : ""
     def config_arg = params.config ? "--config '${params.config}'" : ""
     """
-    CUDA_VISIBLE_DEVICES="" casanovo sequence \\
+    casanovo sequence \\
         ${model_arg} \\
         ${config_arg} \\
         --output_dir . \\
@@ -177,7 +177,7 @@ process CASANOVO_ORIGINAL {
     def model_arg  = params.original_model ? "--model '${params.original_model}'" : ""
     def config_arg = params.config         ? "--config '${params.config}'"        : ""
     """
-    CUDA_VISIBLE_DEVICES="" casanovo sequence \\
+    casanovo sequence \\
         ${model_arg} \\
         ${config_arg} \\
         --output_dir . \\
