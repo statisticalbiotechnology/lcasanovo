@@ -10,13 +10,19 @@ The goal of this fork is to extend Casanovo for antibody sequencing from HCD spe
 
 ### Planned pipeline
 
-1. **IMGT database search**: Assign framework region spectra via database matching. Framework-assigned spectra are deprioritized for de novo treatment but provide absolute IMGT-numbered coordinate anchors for subsequent alignment.
+The scaffold is built **reference-free** from the reads themselves: the ~23x redundancy and long, overlapping HTA-protease peptides provide the linkage (OLC-style assembly over probability profiles rather than discrete bases). No target reference sequence is used.
 
-2. **First-pass decoding**: Run Casanovo's decoder on each CDR-covering spectrum to produce a per-position amino acid probability profile — raw softmax outputs over the token vocabulary at each decoding step, without committing to a sequence path.
+1. **First-pass profiling** — `casanovo profile <peaks>` → `.npz` of per-spectrum softmax distributions (`Spec2Pep.decode_profiles` in `denovo/model.py`, runner glue in `ModelRunner.profile`). Profiles are path-dependent (each step is conditioned on the greedy-chosen prefix), variable length, and in raw decoding order — C→N for the default reverse tokenizer; `load_profiles` in `denovo/assembly.py` reorients to N→C before alignment. They are not precursor-mass-calibrated.
 
-3. **MSA construction**: Align profiles into a multiple sequence alignment using the IMGT framework anchors as an initial scaffold. CDR-overlapping and CDR-internal profiles are placed by profile-profile alignment (e.g., sliding-window similarity between probability vectors) against the growing MSA. Position mapping emerges from the alignment rather than being determined upfront. The high redundancy of HTA-protease data is expected to ensure every CDR3 position is covered by at least one peptide spanning into a framework anchor.
+2. **Overlap assembly in mass coordinate (OLC)** — `casanovo assemble <profile.npz...>` → `.consensus.npz` + `.bestpath.fasta` (`denovo/assembly.py`). Alignment uses **cumulative mass from the N-terminus**, not residue index — equal-mass/different-length tokenizations (exact I/L; near-isobars GG↔N, AG↔Q) break index alignment but agree in mass. The structure is a DAG of mass nodes (a PRM/spectrum graph): nodes are tolerance-binned cumulative masses, edges are residue steps carrying the first-pass profile probability; equal-mass residues collapse onto a shared node as an edge-label sub-distribution. The layout grows **incrementally**: seed with the highest-confidence-weighted-by-length read at shift=0; each subsequent read's N-term offset is chosen to maximise confidence-weighted ppm-binned mass-node overlap with the existing layout. Consensus is **mean** fusion of the outgoing-edge distributions at each node (1/coverage weight buries confident-wrong reads). v1 default ppm tolerance is 25; min-overlap thresholds are 3 nodes / 0.5 score.
 
-4. **Second-pass beam search**: Re-run beam search per spectrum with the MSA profile providing position-specific priors that bias token probabilities at each decoding step, weighting evidence across all aligned spectra.
+3. **Second-pass decoding** — two readouts of the consensus DAG, both implemented:
+   - `bestpath` (alignment-only): the highest-confidence walk from the N-pin through the consensus DAG. Emitted as a FASTA by `casanovo assemble`. Single candidate sequence per assembly; no model required at read-off time. (`bestpath()` in `denovo/assembly.py`.)
+   - `casanovo redecode <peaks> --consensus <consensus.npz>`: re-runs the model with a per-step prior — at every decoding step, the model's softmax is linearly blended (`alpha`, default 0.5) with the mean-fused consensus distribution at the current cumulative mass. Mass coordinate is reorientated for C→N decoders. (`Spec2Pep.decode_with_priors` in `denovo/model.py`, runner glue in `ModelRunner.redecode`; outputs are a casanovo-style mzTab.)
+
+**Layout branch policy (v1, single antibody)**: branches are decided by support×confidence, never by identity/edit-distance, and mass closure (each read must sum to its precursor) kills many false overlaps for free. Bubbles — paths that reconverge on a shared node at equal mass — are kept as parallel edges, never collapsed. A confident divergence supported by many reads is treated as two things that should not merge → keep as separate contigs. A lone or low-confidence divergence is attributed to error → trim the read at the branch or drop it. **Revisit when extending to 2–4 mAb mixtures**: preserving genuine allelic/clonal branches as distinct paths becomes the central problem there, and this "don't fork" policy will need to change.
+
+**IMGT/germline databases are optional**, not load-bearing: used only to assign absolute IMGT numbering for interpretability and to rescue low-coverage stretches — never to seed the assembly.
 
 The initial target is single-antibody sequencing; extension to low-complexity mixtures (e.g., 2–4 mAbs) is a subsequent goal.
 
@@ -59,14 +65,29 @@ PRs should target the `dev` branch, not `main`.
 
 ### Key Modules
 
-- **`casanovo/casanovo.py`** — Click CLI: `sequence`, `db_search`, `train`, `configure`, `version`
-- **`casanovo/denovo/model.py`** — `Spec2Pep`: PyTorch Lightning module, main encoder-decoder transformer
+- **`casanovo/casanovo.py`** — Click CLI: `sequence`, `profile`, `assemble`, `redecode`, `db_search`, `train`, `configure`, `version`
+- **`casanovo/denovo/model.py`** — `Spec2Pep`: PyTorch Lightning module, main encoder-decoder transformer. Three decoder entry points: `forward`/`beam_search_decode` (production), `decode_profiles` (greedy + emit full softmax for assembly), `decode_with_priors` (greedy + blend with consensus prior for second-pass refinement).
 - **`casanovo/denovo/transformers.py`** — `SpectrumEncoder` and `PeptideDecoder` components
-- **`casanovo/denovo/model_runner.py`** — Orchestrates training and inference, model weight download/caching
+- **`casanovo/denovo/model_runner.py`** — Orchestrates training and inference, model weight download/caching. Stage methods: `predict` (mzTab from beam search), `profile` (npz of softmax profiles), `assemble` (delegates to `denovo.assembly`), `redecode` (mzTab from biased decoding).
+- **`casanovo/denovo/assembly.py`** — Mass-coordinate OLC assembly. `Layout` DAG, `build_layout` (incremental anchored OLC), `bestpath` (highest-conf walk), `consensus_lookup` (per-mass prior callable used by `decode_with_priors`), `save_consensus` / `load_consensus`.
 - **`casanovo/denovo/dataloaders.py`** — `DeNovoDataModule` for spectrum batching
 - **`casanovo/data/psm.py`** — `PepSpecMatch` dataclass representing a peptide-spectrum match
 - **`casanovo/data/ms_io.py`** — Mass spec file I/O (mzML, mzXML, MGF)
 - **`casanovo/config.py`** — YAML-based configuration with defaults bundled in package
+
+### Nextflow pipeline (`pipeline/main.nf`)
+
+Drives the four CLI commands for a comparative run. Default path (no flags beyond `--input_dir`/`--pxd`) only runs `casanovo sequence` (baseline first-pass). Flags:
+
+| Flag | Default | Activates |
+|---|---|---|
+| `--compare` | off | also runs upstream casanovo (env `casanovo_orig`) → `COMPARE_PREDICTIONS` |
+| `--use_consensus` | off | runs `PROFILE_LCA → ASSEMBLE_LCA → REDECODE_LCA` chain |
+| `--compare` AND `--use_consensus` | — | adds `COMPARE_PREDICTIONS_FULL` (4-way: lca/orig/redecoded + bestpath) |
+| `--ppm_tolerance` | 25 | consensus layout node binning tolerance |
+| `--redecode_alpha` | 0.5 | prior blend weight in `decode_with_priors` (0 = pure model, 1 = pure consensus) |
+
+`main.nf` on the laptop/desktop uses `/home/lukask/miniconda3/envs/…` conda paths and no GPU pinning. The aeserv22a copy uses `/home/lukask/.conda/envs/…`, `export CUDA_VISIBLE_DEVICES=1` (pins to the free A6000), and `maxForks 1` on all GPU-bound processes; do not blindly `git pull` it across machines.
 
 ### Model Architecture
 
@@ -79,3 +100,50 @@ PRs should target the `dev` branch, not `main`.
 ### Configuration
 
 YAML config (`casanovo/config.yaml` default, user-overridable). Controls model hyperparameters, spectrum preprocessing, training settings, and output options. Generate a custom config with `casanovo configure`.
+
+## Current state & next steps (2026-05-29 handover)
+
+**Built and unit-tested locally:**
+- `casanovo profile` / `assemble` / `redecode` CLI subcommands
+- Mass-coordinate OLC `Layout` + `bestpath` + `consensus_lookup` (`casanovo/denovo/assembly.py`)
+- `Spec2Pep.decode_with_priors`, `ModelRunner.{assemble, redecode}`
+- 6 new unit tests in `tests/unit_tests/test_assembly.py` (all pass; rest of suite still passes minus the pre-existing `test_spectrum_id_mgf`)
+- Pipeline: new processes `PROFILE_LCA` / `ASSEMBLE_LCA` / `REDECODE_LCA` / `COMPARE_PREDICTIONS_FULL`; gated by `--use_consensus`
+
+**Pushed to aeserv22a** (`/home/lukask/git/lcasanovo/`, same paths as local): all Python files; `pipeline/main.nf` carries the aeserv22a-specific GPU pinning and `.conda` env paths.
+
+**Not yet run on real data.** The biggest open question is whether `--use_consensus` actually improves AA accuracy on Herceptin over the 0.44 baseline (`compare_from_cache.py` numbers from the prior session). The right machine is **aeserv22a** — local GTX 1070 is too slow for `casanovo profile` (timed out at 10 min on one ~170 MB Herceptin mzML on CPU).
+
+**Recipe to resume from a laptop and run end-to-end:**
+
+```bash
+# All on aeserv22a (the repo is at /home/lukask/git/lcasanovo there).
+ssh aeserv22a.scilifelab.se
+source /opt/miniconda3/etc/profile.d/conda.sh && conda activate lcasanovo
+cd /home/lukask/git/lcasanovo/pipeline
+
+# Smoke test on one Herceptin mzML first (~few min on the A6000 once running):
+~/bin/nextflow run main.nf \
+    --input_dir /tmp/one_mzml/        \   # symlink one of /home/lukask/pxd023419_mzml/Peng2021_Herceptin_*.mzML into here
+    --use_consensus                       \
+    --model /home/lukask/.cache/casanovo/casanovo_v5_0_0_v5_0_0.ckpt \
+    --outdir /home/lukask/git/lcasanovo/pipeline/results_smoke \
+    -profile local -ansi-log false
+
+# Full Herceptin + comparison:
+~/bin/nextflow run main.nf \
+    --input_dir /home/lukask/pxd023419_raw/ \
+    --compare                                \
+    --use_consensus                          \
+    --model /home/lukask/.cache/casanovo/casanovo_v5_0_0_v5_0_0.ckpt \
+    --outdir /home/lukask/git/lcasanovo/pipeline/results \
+    -profile local -ansi-log false
+```
+
+The 4-way comparison summary lands at `results/comparison_full_summary.tsv`. The bestpath candidate-vs-reference scores land at `results/bestpath_vs_reference.tsv` (one row per accession's bestpath FASTA). The previous baseline numbers (AA acc 0.44 on Herceptin first-pass) live in `compare_from_cache.py` and the memory file `pipeline-reference-bug`.
+
+**Things to keep an eye on the first time you run it:**
+- `casanovo redecode` re-runs the model on every spectrum (same cost as `casanovo sequence`); budget similar GPU time as a baseline run.
+- The aeserv22a `pipeline/work/` cache should let `CONVERT_RAW` and `CASANOVO_LCASANOVO` cache-hit when re-using `--input_dir /home/lukask/pxd023419_raw/` — `PROFILE_LCA` is new so it will run from scratch.
+- The layout's incremental alignment is O(reads × layout_size) per pass; for ~10k Herceptin spectra it may want either a smarter seeding scheme or a per-enzyme grouping. If the first run is slow or noisy, look there.
+- Untracked files (`prototypes/`, `vesuvio.pdf`) are intentional and gitignored.

@@ -213,6 +213,218 @@ def sequence(
     nargs=-1,
     type=click.Path(exists=True, dir_okay=True),
 )
+def profile(
+    peak_path: Tuple[str],
+    model: Optional[str],
+    config: Optional[str],
+    output_dir: Optional[str],
+    output_root: Optional[str],
+    verbosity: str,
+    force_overwrite: bool,
+) -> None:
+    """First-pass greedy profiling for mass-ladder assembly.
+
+    PEAK_PATH must be one or more mzML, mzXML, or MGF files. Emits an
+    .npz of per-spectrum token-probability profiles plus precursor and
+    vocabulary metadata — the input to reference-free overlap assembly.
+    """
+    output_path, output_root_name = _setup_output(
+        output_dir, output_root, force_overwrite, verbosity
+    )
+
+    start_time = time.time()
+    utils.log_system_info()
+
+    utils.check_dir_file_exists(output_path, f"{output_root_name}.npz")
+    config, model = setup_model(
+        model, config, output_path, output_root_name, False
+    )
+
+    with ModelRunner(
+        config,
+        model,
+        output_path,
+        output_root_name if output_root is not None else None,
+        False,
+    ) as runner:
+        logger.info("Profiling peptides from:")
+        for peak_file in peak_path:
+            logger.info("  %s", peak_file)
+
+        profile_path = output_path / f"{output_root_name}.npz"
+        runner.profile(peak_path, str(profile_path))
+        logger.info("Profiling done in %.1f s", time.time() - start_time)
+
+
+@main.command(cls=_SharedFileIOParams)
+@click.argument(
+    "profile_path",
+    required=True,
+    nargs=-1,
+    type=click.Path(exists=True, dir_okay=False),
+)
+@click.option(
+    "--ppm-tolerance",
+    default=25.0,
+    type=float,
+    show_default=True,
+    help="Layout node binning tolerance in ppm of cumulative mass.",
+)
+def assemble(
+    profile_path: Tuple[str],
+    output_dir: Optional[str],
+    output_root: Optional[str],
+    verbosity: str,
+    force_overwrite: bool,
+    ppm_tolerance: float,
+) -> None:
+    """Mass-coordinate OLC assembly over first-pass profiles.
+
+    PROFILE_PATH is one or more ``.npz`` files produced by
+    ``casanovo profile``. Writes ``<output_root>.consensus.npz`` (the
+    full consensus DAG) and ``<output_root>.bestpath.fasta`` (the
+    highest-confidence walk through the DAG, an alignment-only
+    candidate antibody sequence) to ``--output_dir``.
+    """
+    output_path, output_root_name = _setup_output(
+        output_dir, output_root, force_overwrite, verbosity
+    )
+
+    start_time = time.time()
+    utils.log_system_info()
+
+    consensus_path = output_path / f"{output_root_name}.consensus.npz"
+    bestpath_path = output_path / f"{output_root_name}.bestpath.fasta"
+    utils.check_dir_file_exists(
+        output_path, f"{output_root_name}.consensus.npz"
+    )
+    utils.check_dir_file_exists(
+        output_path, f"{output_root_name}.bestpath.fasta"
+    )
+
+    # Pure-data stage: no model, no Lightning trainer — call the
+    # assembly helpers directly.
+    from .denovo.assembly import (
+        build_layout,
+        load_profiles,
+        bestpath,
+        save_consensus,
+    )
+
+    logger.info("Assembling from:")
+    for p in profile_path:
+        logger.info("  %s", p)
+
+    reads, meta = load_profiles(list(profile_path))
+    layout = build_layout(
+        reads,
+        vocab=meta["vocab"],
+        token_masses=meta["token_masses"],
+        ppm_tolerance=ppm_tolerance,
+    )
+    save_consensus(layout, str(consensus_path))
+    seq, scores, _ = bestpath(layout)
+    mean_score = float(sum(scores) / len(scores)) if scores else 0.0
+    with open(bestpath_path, "w") as fh:
+        fh.write(
+            f">consensus_bestpath len={len(seq)} "
+            f"mean_conf={mean_score:.4f} "
+            f"placed={len(layout.read_shifts)} "
+            f"unplaced={len(layout.unplaced)}\n"
+        )
+        for k in range(0, len(seq), 60):
+            fh.write(seq[k : k + 60] + "\n")
+
+    logger.info(
+        "Wrote %s (%d nodes, %d edges) and %s (%d aa, mean conf %.3f)",
+        consensus_path,
+        len(layout.nodes),
+        len(layout.edges),
+        bestpath_path,
+        len(seq),
+        mean_score,
+    )
+    logger.info("Assembly done in %.1f s", time.time() - start_time)
+
+
+@main.command(cls=_SharedParams)
+@click.argument(
+    "peak_path",
+    required=True,
+    nargs=-1,
+    type=click.Path(exists=True, dir_okay=True),
+)
+@click.option(
+    "--consensus",
+    "consensus_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False),
+    help=".npz consensus DAG from `casanovo assemble`.",
+)
+@click.option(
+    "--alpha",
+    default=0.5,
+    type=float,
+    show_default=True,
+    help="Prior blend weight; 0=pure model, 1=pure consensus.",
+)
+def redecode(
+    peak_path: Tuple[str],
+    consensus_path: str,
+    alpha: float,
+    model: Optional[str],
+    config: Optional[str],
+    output_dir: Optional[str],
+    output_root: Optional[str],
+    verbosity: str,
+    force_overwrite: bool,
+) -> None:
+    """Second-pass biased decoding using a consensus DAG as prior.
+
+    Re-runs the model on PEAK_PATH but at each decoding step blends the
+    softmax with the mean-fused consensus distribution at the current
+    cumulative mass. Emits a casanovo-style mzTab with the refined PSMs.
+    """
+    output_path, output_root_name = _setup_output(
+        output_dir, output_root, force_overwrite, verbosity
+    )
+
+    start_time = time.time()
+    utils.log_system_info()
+
+    utils.check_dir_file_exists(output_path, f"{output_root_name}.mztab")
+    cfg, model = setup_model(
+        model, config, output_path, output_root_name, False
+    )
+
+    with ModelRunner(
+        cfg,
+        model,
+        output_path,
+        output_root_name if output_root is not None else None,
+        False,
+    ) as runner:
+        logger.info("Re-decoding (alpha=%.2f) from:", alpha)
+        for peak_file in peak_path:
+            logger.info("  %s", peak_file)
+        logger.info("  consensus: %s", consensus_path)
+
+        results_path = output_path / f"{output_root_name}.mztab"
+        runner.redecode(
+            peak_path, consensus_path, str(results_path), alpha=alpha
+        )
+        utils.log_annotate_report(
+            runner.writer.psms, start_time=start_time, end_time=time.time()
+        )
+
+
+@main.command(cls=_SharedParams)
+@click.argument(
+    "peak_path",
+    required=True,
+    nargs=-1,
+    type=click.Path(exists=True, dir_okay=True),
+)
 @click.argument(
     "fasta_path",
     required=True,

@@ -5,7 +5,17 @@ import heapq
 import itertools
 import logging
 import warnings
-from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import einops
 import lightning.pytorch as pl
@@ -17,7 +27,6 @@ from .. import config
 from ..data import ms_io, psm
 from ..denovo.transformers import PeptideDecoder, SpectrumEncoder
 from . import evaluate
-
 
 logger = logging.getLogger("casanovo")
 
@@ -486,6 +495,123 @@ class Spec2Pep(pl.LightningModule):
             profiles.append(all_probs[b, :length, :].numpy())
 
         return profiles
+
+    def decode_with_priors(
+        self,
+        mzs: torch.Tensor,
+        intensities: torch.Tensor,
+        precursors: torch.Tensor,
+        priors: List["Optional[Callable[[float], Optional[np.ndarray]]]"],
+        alpha: float = 0.5,
+    ) -> List[Tuple[List[int], np.ndarray]]:
+        """
+        Greedy decoding with a per-spectrum prior over residue tokens.
+
+        At each step, blends the model's softmax distribution with a
+        prior distribution looked up via ``priors[i](cum_mass)`` —
+        where ``cum_mass`` is the N-terminal cumulative mass of the
+        beam's currently-predicted prefix for spectrum ``i``. This is
+        the second-pass refinement step described in CLAUDE.md: the
+        prior comes from the mean-fused consensus DAG at the read's
+        current mass coordinate.
+
+        The blend is a coverage-aware linear mix:
+        ``combined = (1 - alpha) * model + alpha * prior``. When the
+        prior lookup returns ``None`` (no consensus node within ppm),
+        we fall back to the model's distribution unchanged.
+
+        Cumulative mass is computed in the **decoder's natural
+        direction**. For a C→N (reverse) tokenizer this means C-terminal
+        cumulative mass — callers must pass priors keyed on the same
+        coordinate (callers using an N→C-oriented consensus should pass
+        priors whose argument is ``precursor_mass - cum_mass`` for
+        reverse decoders).
+
+        Parameters
+        ----------
+        mzs, intensities, precursors
+            As for :meth:`decode_profiles`.
+        priors
+            List of length ``mzs.shape[0]``. Each entry is either
+            ``None`` (no prior; equivalent to pure greedy) or a
+            callable mapping a cumulative mass to a numpy array of
+            shape ``(vocab_size,)`` summing to ≤ 1.
+        alpha
+            Weight on the prior in the linear blend. ``0`` → pure model
+            greedy, ``1`` → pure consensus walk.
+
+        Returns
+        -------
+        List of (token_indices, per_step_max_probabilities) for each
+        spectrum, with the stop token stripped if present.
+        """
+        memories, mem_masks = self.encoder(mzs, intensities)
+        batch = mzs.shape[0]
+        device = self.device
+
+        tokens = torch.zeros(batch, 0, dtype=torch.int64, device=device)
+        finished = torch.zeros(batch, dtype=torch.bool, device=device)
+        max_probs_per_step: List[torch.Tensor] = []
+        all_step_tokens: List[torch.Tensor] = []
+        # Per-spectrum cumulative mass tracker (in the decoder's
+        # natural direction). Built from each step's chosen token.
+        cum_mass = np.zeros(batch, dtype=np.float64)
+        token_mass_cpu = self.token_masses.detach().cpu().numpy()
+
+        for _ in range(self.max_peptide_len):
+            logits = self.decoder(
+                tokens=tokens,
+                memory=memories,
+                memory_key_padding_mask=mem_masks,
+                precursors=precursors,
+            )
+            probs = self.softmax(logits)[:, -1, :]  # (batch, vocab)
+            probs_np = probs.detach().cpu().numpy()
+
+            # Blend with prior where supplied and live.
+            for i in range(batch):
+                if finished[i] or priors[i] is None:
+                    continue
+                prior = priors[i](float(cum_mass[i]))
+                if prior is None:
+                    continue
+                blended = (1.0 - alpha) * probs_np[i] + alpha * prior
+                # Renormalise defensively (prior may not sum to 1).
+                s = blended.sum()
+                if s > 0:
+                    probs_np[i] = blended / s
+
+            chosen = probs_np.argmax(axis=-1)
+            step_probs = probs_np[np.arange(batch), chosen]
+            all_step_tokens.append(torch.from_numpy(chosen.astype(np.int64)))
+            max_probs_per_step.append(torch.from_numpy(step_probs))
+
+            # Advance cumulative mass with the chosen token.
+            cum_mass += token_mass_cpu[chosen]
+            tokens = torch.cat(
+                [
+                    tokens,
+                    torch.from_numpy(chosen.astype(np.int64))
+                    .to(device)
+                    .unsqueeze(1),
+                ],
+                dim=1,
+            )
+            finished |= torch.from_numpy(chosen).to(device) == self.stop_token
+            if finished.all():
+                break
+
+        token_seq = torch.stack(all_step_tokens, dim=1).cpu().numpy()
+        prob_seq = torch.stack(max_probs_per_step, dim=1).cpu().numpy()
+
+        out: List[Tuple[List[int], np.ndarray]] = []
+        for b in range(batch):
+            stop_pos = np.where(token_seq[b] == self.stop_token)[0]
+            length = (
+                int(stop_pos[0]) if stop_pos.size > 0 else token_seq.shape[1]
+            )
+            out.append((token_seq[b, :length].tolist(), prob_seq[b, :length]))
+        return out
 
     def _finish_beams(
         self,

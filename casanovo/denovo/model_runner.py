@@ -11,6 +11,7 @@ from typing import Iterable, List, Optional, Sequence, Union
 
 import lightning.pytorch as pl
 import lightning.pytorch.loggers
+import numpy as np
 import torch
 import torch.utils.data
 from depthcharge.tokenizers import PeptideTokenizer
@@ -21,11 +22,10 @@ from torch.utils.data import DataLoader
 
 from .. import utils
 from ..config import Config
-from ..data import db_utils, ms_io
+from ..data import db_utils, ms_io, psm
 from ..denovo.dataloaders import DeNovoDataModule
 from ..denovo.evaluate import aa_match_batch, aa_match_metrics
 from ..denovo.model import DbSpec2Pep, Spec2Pep
-
 
 logger = logging.getLogger("casanovo")
 
@@ -313,6 +313,300 @@ class ModelRunner:
 
         if evaluate:
             self.log_metrics(predict_dataloader)
+
+    def profile(
+        self,
+        peak_path: Iterable[str],
+        profile_path: str,
+    ) -> None:
+        """
+        First-pass greedy profiling for mass-ladder assembly.
+
+        Runs `Spec2Pep.decode_profiles` over every spectrum and
+        serializes the per-position token-probability profiles together
+        with precursor and vocabulary metadata into a single ``.npz``.
+        This is the input to reference-free overlap assembly; no mzTab
+        is produced.
+
+        Parameters
+        ----------
+        peak_path : Iterable[str]
+            The paths with the MS data files to profile.
+        profile_path : str
+            Output path for the serialized profiles (``.npz``).
+        """
+        self.initialize_trainer(train=False)
+        self.initialize_tokenizer()
+        self.initialize_model(train=False)
+
+        test_paths = self._get_input_paths(peak_path, False, "test")
+        self.initialize_data_module(test_paths=test_paths)
+        self.loaders.setup(stage="test", annotated=False)
+
+        if self.config.accelerator == "cpu" or not torch.cuda.is_available():
+            device = torch.device("cpu")
+        else:
+            device = torch.device("cuda")
+        model = self.model.to(device)
+        model.eval()
+
+        profiles, lengths = [], []
+        peak_files, scan_ids = [], []
+        precursor_mz, precursor_charge, precursor_mass = [], [], []
+
+        with torch.no_grad():
+            for batch in self.loaders.predict_dataloader():
+                mzs, ints, precursors, _ = model._process_batch(batch)
+                batch_profiles = model.decode_profiles(
+                    mzs.to(device), ints.to(device), precursors.to(device)
+                )
+                pre = precursors.cpu().numpy()
+                files = list(batch["peak_file"])
+                scans = list(batch["scan_id"])
+                for i, prof in enumerate(batch_profiles):
+                    profiles.append(prof.astype(np.float32))
+                    lengths.append(prof.shape[0])
+                    peak_files.append(str(files[i]))
+                    scan = scans[i]
+                    scan_ids.append(
+                        str(scan.item() if torch.is_tensor(scan) else scan)
+                    )
+                    precursor_mass.append(float(pre[i, 0]))
+                    precursor_charge.append(int(pre[i, 1]))
+                    precursor_mz.append(float(pre[i, 2]))
+
+        vocab_tokens = [""] * model.vocab_size
+        for tok, idx in model.tokenizer.index.items():
+            if 0 <= idx < model.vocab_size:
+                vocab_tokens[idx] = tok
+
+        profiles_concat = (
+            np.concatenate(profiles, axis=0)
+            if profiles
+            else np.zeros((0, model.vocab_size), dtype=np.float32)
+        )
+
+        np.savez_compressed(
+            profile_path,
+            profiles_concat=profiles_concat,
+            lengths=np.asarray(lengths, dtype=np.int32),
+            peak_file=np.asarray(peak_files),
+            scan_id=np.asarray(scan_ids),
+            precursor_mz=np.asarray(precursor_mz, dtype=np.float64),
+            precursor_charge=np.asarray(precursor_charge, dtype=np.int32),
+            precursor_mass=np.asarray(precursor_mass, dtype=np.float64),
+            token_masses=model.token_masses.cpu().numpy(),
+            vocab_tokens=np.asarray(vocab_tokens),
+            stop_int=np.int32(model.stop_token),
+            decoding_order=("C_to_N" if model.tokenizer.reverse else "N_to_C"),
+        )
+        logger.info(
+            "Wrote %d spectrum profiles to %s", len(lengths), profile_path
+        )
+
+    def assemble(
+        self,
+        profile_paths: Iterable[str],
+        consensus_path: str,
+        bestpath_fasta_path: Optional[str] = None,
+        ppm_tolerance: float = 25.0,
+    ) -> None:
+        """
+        Build a mass-coordinate consensus DAG from first-pass profiles.
+
+        Reads one or more ``.npz`` files produced by :meth:`profile`,
+        constructs an incremental overlap-layout-consensus DAG in
+        cumulative-mass coordinate, and serializes the layout to
+        ``consensus_path``. If ``bestpath_fasta_path`` is given, also
+        writes the highest-confidence path through the DAG to a FASTA.
+
+        Pure data-stage helper — no model required.
+        """
+        from .assembly import (
+            build_layout,
+            load_profiles,
+            bestpath,
+            save_consensus,
+        )
+
+        paths = list(profile_paths)
+        reads, meta = load_profiles(paths)
+        logger.info(
+            "Assembling %d reads from %d profile file(s)",
+            len(reads),
+            len(paths),
+        )
+        if not reads:
+            logger.warning("No reads to assemble; writing empty consensus")
+            save_consensus(
+                build_layout(
+                    [],
+                    meta.get("vocab", np.array([])),
+                    meta.get("token_masses", np.array([])),
+                    ppm_tolerance=ppm_tolerance,
+                ),
+                consensus_path,
+            )
+            return
+
+        layout = build_layout(
+            reads,
+            vocab=meta["vocab"],
+            token_masses=meta["token_masses"],
+            ppm_tolerance=ppm_tolerance,
+        )
+        save_consensus(layout, consensus_path)
+        logger.info(
+            "Wrote consensus DAG (%d nodes, %d edges) to %s",
+            len(layout.nodes),
+            len(layout.edges),
+            consensus_path,
+        )
+
+        if bestpath_fasta_path is not None:
+            seq, scores, _ = bestpath(layout)
+            mean_score = float(np.mean(scores)) if scores else 0.0
+            with open(bestpath_fasta_path, "w") as fh:
+                fh.write(
+                    f">consensus_bestpath len={len(seq)} "
+                    f"mean_conf={mean_score:.4f} "
+                    f"placed={len(layout.read_shifts)} "
+                    f"unplaced={len(layout.unplaced)}\n"
+                )
+                for k in range(0, len(seq), 60):
+                    fh.write(seq[k : k + 60] + "\n")
+            logger.info(
+                "Wrote bestpath FASTA (%d residues, mean conf %.3f) to %s",
+                len(seq),
+                mean_score,
+                bestpath_fasta_path,
+            )
+
+    def redecode(
+        self,
+        peak_path: Iterable[str],
+        consensus_path: str,
+        results_path: str,
+        alpha: float = 0.5,
+    ) -> None:
+        """
+        Second-pass biased decoding seeded by a consensus DAG.
+
+        Runs greedy decoding with a per-step prior drawn from the
+        mean-fused outgoing distribution at the current cumulative
+        mass in the consensus layout. Mirrors :meth:`predict` in I/O
+        shape — emits a casanovo-style mzTab — but uses
+        :meth:`Spec2Pep.decode_with_priors` instead of beam search.
+
+        Parameters
+        ----------
+        peak_path : Iterable[str]
+            MS data files to re-decode.
+        consensus_path : str
+            Path to the consensus ``.npz`` from :meth:`assemble`.
+        results_path : str
+            Output ``.mztab`` path.
+        alpha : float, optional
+            Blend weight on the prior (0 = pure model, 1 = pure
+            consensus). Defaults to 0.5.
+        """
+        from .assembly import consensus_lookup, load_consensus
+
+        self.writer = ms_io.MztabWriter(results_path)
+        self.writer.set_metadata(
+            self.config,
+            model=str(self.model_filename),
+            config_filename=self.config.file,
+        )
+
+        self.initialize_trainer(train=False)
+        self.initialize_tokenizer()
+        self.initialize_model(train=False)
+
+        test_paths = self._get_input_paths(peak_path, False, "test")
+        self.writer.set_ms_run(test_paths)
+        self.initialize_data_module(test_paths=test_paths)
+        self.loaders.setup(stage="test", annotated=False)
+
+        layout = load_consensus(consensus_path)
+        global_lookup = consensus_lookup(layout)
+        # Decoder may be C→N; the layout's mass coordinate is N→C, so
+        # for reverse decoders we lookup against ``precursor - cum``.
+        reverse_decoder = self.model.tokenizer.reverse
+
+        if self.config.accelerator == "cpu" or not torch.cuda.is_available():
+            device = torch.device("cpu")
+        else:
+            device = torch.device("cuda")
+        model = self.model.to(device)
+        model.eval()
+
+        with torch.no_grad():
+            for batch in self.loaders.predict_dataloader():
+                mzs, ints, precursors, _ = model._process_batch(batch)
+                pre_np = precursors.cpu().numpy()
+                priors = []
+                for i in range(mzs.shape[0]):
+                    pmass = float(pre_np[i, 0])
+                    if reverse_decoder:
+                        priors.append(
+                            lambda cum, pmass=pmass: global_lookup(pmass - cum)
+                        )
+                    else:
+                        priors.append(lambda cum: global_lookup(cum))
+
+                results = model.decode_with_priors(
+                    mzs.to(device),
+                    ints.to(device),
+                    precursors.to(device),
+                    priors,
+                    alpha=alpha,
+                )
+
+                files = list(batch["peak_file"])
+                scans = list(batch["scan_id"])
+                charges = list(batch["precursor_charge"])
+                mzs_pre = list(batch["precursor_mz"])
+                for i, (tok_ids, step_probs) in enumerate(results):
+                    if not tok_ids:
+                        continue
+                    seq = self.model.tokenizer.detokenize(
+                        torch.tensor([tok_ids])
+                    )[0]
+                    aa_scores = step_probs.astype(np.float32)
+                    if reverse_decoder:
+                        aa_scores = aa_scores[::-1]
+                    pep_score = (
+                        float(np.mean(aa_scores)) if aa_scores.size else 0.0
+                    )
+                    scan = scans[i]
+                    self.writer.psms.append(
+                        psm.PepSpecMatch(
+                            sequence=seq,
+                            spectrum_id=(
+                                str(files[i]),
+                                str(
+                                    scan.item()
+                                    if torch.is_tensor(scan)
+                                    else scan
+                                ),
+                            ),
+                            peptide_score=pep_score,
+                            charge=int(charges[i]),
+                            calc_mz=float("nan"),
+                            exp_mz=float(
+                                mzs_pre[i].item()
+                                if torch.is_tensor(mzs_pre[i])
+                                else mzs_pre[i]
+                            ),
+                            aa_scores=aa_scores.tolist(),
+                        )
+                    )
+
+        self.writer.save()
+        logger.info(
+            "Wrote re-decoded mzTab (alpha=%.2f) to %s", alpha, results_path
+        )
 
     def initialize_trainer(self, train: bool) -> None:
         """

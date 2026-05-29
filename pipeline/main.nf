@@ -14,6 +14,9 @@ params.outdir           = "results"
 params.reference_fasta  = null   // reference protein FASTA for accuracy assessment
                                   // if null and --compare is set, fetches Herceptin from UniProt
 params.compare          = false  // run both lcasanovo and upstream casanovo and compare
+params.use_consensus    = false  // additionally run profile → assemble → redecode
+params.ppm_tolerance    = 25.0   // consensus layout node ppm tolerance
+params.redecode_alpha   = 0.5    // prior blend weight for second-pass decoding
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -186,7 +189,99 @@ process CASANOVO_ORIGINAL {
     """
 }
 
-// Fetch Herceptin reference sequences from UniProt (heavy + light chain)
+// --- Profile → Assemble → Re-decode (mass-coordinate consensus) ---
+//
+// Three-stage refinement of lcasanovo predictions:
+//   1. PROFILE_LCA: emit per-spectrum softmax profiles to .npz.
+//   2. ASSEMBLE_LCA: build a mass-coordinate consensus DAG across all
+//      profiles for an accession; emit consensus.npz + bestpath.fasta.
+//   3. REDECODE_LCA: re-run decoding biased by the consensus prior.
+// Activated by `--use_consensus`; orthogonal to the upstream-vs-fork
+// `--compare` baseline path.
+
+// Per-spectrum first-pass profile (.npz)
+process PROFILE_LCA {
+    tag "$accession / ${spectrum_file.name}"
+    publishDir "${params.outdir}/profiles/${accession}", mode: 'copy'
+    conda '/home/lukask/miniconda3/envs/lcasanovo'
+
+    input:
+    tuple val(accession), path(spectrum_file)
+
+    output:
+    tuple val(accession), val("${spectrum_file.baseName}"), path("${spectrum_file.baseName}.npz"), emit: npz
+
+    script:
+    def model_arg  = params.model  ? "--model '${params.model}'"   : ""
+    def config_arg = params.config ? "--config '${params.config}'" : ""
+    """
+    casanovo profile \\
+        ${model_arg} \\
+        ${config_arg} \\
+        --output_dir . \\
+        --output_root "${spectrum_file.baseName}" \\
+        "${spectrum_file}"
+    """
+}
+
+// Build the mass-coordinate consensus DAG across all profiles for an
+// accession. Emits ``consensus.npz`` and the alignment-only candidate
+// ``bestpath.fasta``. Pure data stage — no GPU required.
+process ASSEMBLE_LCA {
+    tag "$accession"
+    publishDir "${params.outdir}/consensus/${accession}", mode: 'copy'
+    conda '/home/lukask/miniconda3/envs/lcasanovo'
+
+    input:
+    tuple val(accession), path(npzs, stageAs: "profiles/*")
+
+    output:
+    tuple val(accession), path("${accession}.consensus.npz"), emit: consensus
+    tuple val(accession), path("${accession}.bestpath.fasta"), emit: bestpath
+
+    script:
+    """
+    casanovo assemble \\
+        --output_dir . \\
+        --output_root "${accession}" \\
+        --ppm-tolerance ${params.ppm_tolerance} \\
+        profiles/*.npz
+    """
+}
+
+// Re-decode each spectrum file with the consensus DAG as prior.
+process REDECODE_LCA {
+    tag "$accession / ${spectrum_file.name}"
+    publishDir "${params.outdir}/predictions/redecoded/${accession}", mode: 'copy'
+    conda '/home/lukask/miniconda3/envs/lcasanovo'
+
+    input:
+    tuple val(accession), path(spectrum_file), path(consensus)
+
+    output:
+    tuple val(accession), val("${spectrum_file.baseName}"), path("${spectrum_file.baseName}.mztab"), emit: mztab
+    tuple val(accession), path("${spectrum_file.baseName}.log"),                                     emit: log
+
+    script:
+    def model_arg  = params.model  ? "--model '${params.model}'"   : ""
+    def config_arg = params.config ? "--config '${params.config}'" : ""
+    """
+    casanovo redecode \\
+        ${model_arg} \\
+        ${config_arg} \\
+        --consensus "${consensus}" \\
+        --alpha ${params.redecode_alpha} \\
+        --output_dir . \\
+        --output_root "${spectrum_file.baseName}" \\
+        "${spectrum_file}"
+    """
+}
+
+// Emit Herceptin (trastuzumab) reference sequences — published full-length
+// heavy and light chains (DrugBank DB00072 / IMGT). Previously this fetched
+// UniProt P0DOX7/P0DOX8, but those are generic kappa/lambda light chains
+// (no heavy/Fc), which invalidated accuracy scoring against trastuzumab
+// spectra. See prototypes/cross_check_reference.py for validation.
 process FETCH_REFERENCE {
     publishDir "${params.outdir}/reference", mode: 'copy'
 
@@ -195,19 +290,23 @@ process FETCH_REFERENCE {
 
     script:
     """
-    python3 - <<'EOF'
-import urllib.request
-
-# Herceptin (trastuzumab): P0DOX7 = heavy chain, P0DOX8 = light chain
-accessions = ['P0DOX7', 'P0DOX8']
-with open('reference.fasta', 'w') as fh:
-    for acc in accessions:
-        url = f"https://www.uniprot.org/uniprot/{acc}.fasta"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as resp:
-            fh.write(resp.read().decode())
-print("Fetched Herceptin heavy and light chain sequences from UniProt")
+    cat > reference.fasta <<'EOF'
+>trastuzumab_HC humanized IgG1 heavy chain (450 aa, DrugBank DB00072)
+EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGKGLEWVARIYPTNGYTRYA
+DSVKGRFTISADTSKNTAYLQMNSLRAEDTAVYYCSRWGGDGFYAMDYWGQGTLVTVSSAS
+TKGPSVFPLAPSSKSTSGGTAALGCLVKDYFPEPVTVSWNSGALTSGVHTFPAVLQSSGLY
+SLSSVVTVPSSSLGTQTYICNVNHKPSNTKVDKKVEPKSCDKTHTCPPCPAPELLGGPSVF
+LFPPKPKDTLMISRTPEVTCVVVDVSHEDPEVKFNWYVDGVEVHNAKTKPREEQYNSTYRV
+VSVLTVLHQDWLNGKEYKCKVSNKALPAPIEKTISKAKGQPREPQVYTLPPSREEMTKNQV
+SLTCLVKGFYPSDIAVEWESNGQPENNYKTTPPVLDSDGSFFLYSKLTVDKSRWQQGNVFS
+CSVMHEALHNHYTQKSLSLSPGK
+>trastuzumab_LC humanized kappa light chain (214 aa, DrugBank DB00072)
+DIQMTQSPSSLSASVGDRVTITCRASQDVNTAVAWYQQKPGKAPKLLIYSASFLYSGVPSR
+FSGSRSGTDFTLTISSLQPEDFATYYCQQHYTTPPTFGQGTKVEIKRTVAAPSVFIFPPSD
+EQLKSGTASVVCLLNNFYPREAKVQWKVDNALQSGNSQESVTEQDSKDSTYSLSSTLTLSK
+ADYEKHKVYACEVTHQGLSSPVTKSFNRGEC
 EOF
+    echo "Wrote trastuzumab heavy (450 aa) + light (214 aa) reference"
     """
 }
 
@@ -330,6 +429,172 @@ EOF
     """
 }
 
+// 4-way comparison: first-pass lcasanovo + upstream + redecoded + bestpath.
+// Mirrors COMPARE_PREDICTIONS but adds the consensus-aware candidates.
+process COMPARE_PREDICTIONS_FULL {
+    publishDir "${params.outdir}", mode: 'copy'
+
+    input:
+    path lcasanovo_mztabs, stageAs: "lcasanovo/*"
+    path original_mztabs,  stageAs: "original/*"
+    path redecoded_mztabs, stageAs: "redecoded/*"
+    path bestpath_fastas,  stageAs: "bestpath/*"
+    path reference_fasta
+
+    output:
+    path "comparison_full.tsv"
+    path "comparison_full_summary.tsv"
+    path "bestpath_vs_reference.tsv"
+
+    script:
+    """
+    python3 - <<'EOF'
+import glob, math
+from difflib import SequenceMatcher
+
+def read_mztab_psms(pattern):
+    psms = {}
+    for path in glob.glob(pattern):
+        fname = path.split('/')[-1].replace('.mztab', '')
+        with open(path) as fh:
+            for line in fh:
+                if not line.startswith('PSM\\t'):
+                    continue
+                parts = line.rstrip('\\n').split('\\t')
+                uid = f"{fname}::{parts[2]}"
+                psms[uid] = parts[1]
+    return psms
+
+def read_fasta(path):
+    seqs, name, buf = {}, None, []
+    with open(path) as fh:
+        for line in fh:
+            line = line.rstrip()
+            if line.startswith('>'):
+                if name:
+                    seqs[name] = ''.join(buf)
+                name = line[1:].split()[0]
+                buf = []
+            else:
+                buf.append(line)
+    if name:
+        seqs[name] = ''.join(buf)
+    return seqs
+
+def best_aa_accuracy(predicted, reference_seqs):
+    if not predicted:
+        return float('nan')
+    pred = predicted.upper().replace('I', 'L')
+    plen = len(pred)
+    if plen == 0:
+        return float('nan')
+    best = 0.0
+    for ref in reference_seqs.values():
+        ref = ref.upper().replace('I', 'L')
+        if len(ref) < plen:
+            continue
+        for s in range(len(ref) - plen + 1):
+            m = sum(a == b for a, b in zip(pred, ref[s:s+plen]))
+            best = max(best, m / plen)
+    return best
+
+def mean(vals):
+    v = [x for x in vals if not math.isnan(x)]
+    return round(sum(v) / len(v), 4) if v else float('nan')
+
+# ---- load -----------------------------------------------------------------
+
+lca  = read_mztab_psms("lcasanovo/*.mztab")
+orig = read_mztab_psms("original/*.mztab")
+rdc  = read_mztab_psms("redecoded/*.mztab")
+refs = read_fasta("${reference_fasta}")
+all_ids = sorted(set(lca) | set(orig) | set(rdc))
+
+# ---- per-PSM rows ---------------------------------------------------------
+
+rows = []
+for uid in all_ids:
+    lca_s, orig_s, rdc_s = lca.get(uid, ''), orig.get(uid, ''), rdc.get(uid, '')
+    lca_a  = best_aa_accuracy(lca_s,  refs)
+    orig_a = best_aa_accuracy(orig_s, refs)
+    rdc_a  = best_aa_accuracy(rdc_s,  refs)
+    # delta vs first-pass lcasanovo (the natural baseline)
+    delta = (rdc_a - lca_a) if (not math.isnan(rdc_a) and not math.isnan(lca_a)) else float('nan')
+    ident_lca_rdc = (
+        SequenceMatcher(None, lca_s, rdc_s).ratio()
+        if lca_s and rdc_s else float('nan')
+    )
+    rows.append((uid, lca_s, orig_s, rdc_s,
+                 round(lca_a, 4), round(orig_a, 4), round(rdc_a, 4),
+                 round(delta, 4), round(ident_lca_rdc, 4)))
+
+with open("comparison_full.tsv", 'w') as fh:
+    fh.write("spectrum_id\\tlca_seq\\torig_seq\\tredecoded_seq\\t"
+             "lca_aa_acc\\torig_aa_acc\\tredecoded_aa_acc\\t"
+             "delta_redecoded_minus_lca\\tident_lca_vs_redecoded\\n")
+    for r in rows:
+        fh.write("\\t".join(str(x) for x in r) + "\\n")
+
+# ---- aggregate summary ----------------------------------------------------
+
+lca_accs  = [r[4] for r in rows]
+orig_accs = [r[5] for r in rows]
+rdc_accs  = [r[6] for r in rows]
+deltas    = [r[7] for r in rows]
+
+with open("comparison_full_summary.tsv", 'w') as fh:
+    fh.write("metric\\tlcasanovo\\toriginal_casanovo\\tredecoded\\n")
+    fh.write(f"n_spectra\\t{sum(1 for r in rows if r[1])}\\t"
+             f"{sum(1 for r in rows if r[2])}\\t"
+             f"{sum(1 for r in rows if r[3])}\\n")
+    fh.write(f"mean_aa_accuracy\\t{mean(lca_accs)}\\t{mean(orig_accs)}\\t"
+             f"{mean(rdc_accs)}\\n")
+    for thresh in (0.5, 0.9):
+        def above(accs, t):
+            v = [x for x in accs if not math.isnan(x)]
+            return round(sum(x >= t for x in v) / max(1, len(v)) * 100, 1)
+        fh.write(f"pct_above_{thresh}\\t{above(lca_accs, thresh)}\\t"
+                 f"{above(orig_accs, thresh)}\\t{above(rdc_accs, thresh)}\\n")
+    fh.write(f"mean_delta_redecoded_minus_lca\\t-\\t-\\t{mean(deltas)}\\n")
+
+# ---- bestpath candidates --------------------------------------------------
+
+# Read every bestpath FASTA and score the candidate sequence against ref.
+# The bestpath sequences may be long (up to the full antibody); use a
+# longest-common-substring proxy against any reference, since "slide
+# window" is meaningless when the candidate is the same length as the
+# reference.
+def lcs_fraction(query, target):
+    # fraction of query that's in target as the longest common substring
+    if not query or not target:
+        return 0.0
+    m = SequenceMatcher(None, query, target).find_longest_match(0, len(query), 0, len(target))
+    return m.size / len(query)
+
+with open("bestpath_vs_reference.tsv", 'w') as fh:
+    fh.write("accession\\tcandidate_len\\theader\\tbest_ref_match\\tlcs_fraction\\n")
+    for path in sorted(glob.glob("bestpath/*.fasta")):
+        acc = path.split('/')[-1].replace('.bestpath.fasta', '').replace('.fasta', '')
+        with open(path) as h:
+            lines = h.read().splitlines()
+        if not lines:
+            continue
+        header = lines[0][1:] if lines[0].startswith('>') else acc
+        seq = ''.join(l for l in lines[1:] if not l.startswith('>'))
+        seq_il = seq.upper().replace('I', 'L')
+        best_name, best_frac = '-', 0.0
+        for name, ref in refs.items():
+            ref_il = ref.upper().replace('I', 'L')
+            f = lcs_fraction(seq_il, ref_il)
+            if f > best_frac:
+                best_frac, best_name = f, name
+        fh.write(f"{acc}\\t{len(seq)}\\t{header}\\t{best_name}\\t{round(best_frac, 4)}\\n")
+
+print(f"4-way comparison done over {len(rows)} spectra")
+EOF
+    """
+}
+
 // Concatenate all mzTab PSM rows into a single summary table
 process MERGE_LCASANOVO {
     publishDir "${params.outdir}", mode: 'copy'
@@ -440,6 +705,31 @@ workflow {
     lca_mztabs = CASANOVO_LCASANOVO.out.mztab.map { acc, base, f -> f }.collect()
     MERGE_LCASANOVO(lca_mztabs)
 
+    // --- Optional: mass-coordinate consensus refinement ---
+    // Stages: PROFILE (per spectrum) → ASSEMBLE (per accession) →
+    // REDECODE (per spectrum, biased by consensus).
+    if (params.use_consensus) {
+        PROFILE_LCA(spectrum_files)
+
+        // Group all profiles by accession before assembly so the layout
+        // builds across every spectrum from one antibody/sample.
+        per_acc_profiles = PROFILE_LCA.out.npz
+            .map { acc, base, npz -> tuple(acc, npz) }
+            .groupTuple()
+        ASSEMBLE_LCA(per_acc_profiles)
+
+        // Combine each spectrum with its accession's consensus before
+        // re-decoding.
+        redecode_in = spectrum_files
+            .combine(ASSEMBLE_LCA.out.consensus, by: 0)
+        REDECODE_LCA(redecode_in)
+        rdc_mztabs = REDECODE_LCA.out.mztab.map { acc, base, f -> f }.collect()
+        bestpath_fastas = ASSEMBLE_LCA.out.bestpath.map { acc, f -> f }.collect()
+    } else {
+        rdc_mztabs      = Channel.empty().collect()
+        bestpath_fastas = Channel.empty().collect()
+    }
+
     // --- Optional: upstream casanovo comparison ---
     if (params.compare) {
 
@@ -456,5 +746,13 @@ workflow {
         }
 
         COMPARE_PREDICTIONS(lca_mztabs, orig_mztabs, ref_fasta)
+
+        // With consensus on too, add the 4-way comparison (first-pass
+        // lca + upstream + redecoded + bestpath candidate).
+        if (params.use_consensus) {
+            COMPARE_PREDICTIONS_FULL(
+                lca_mztabs, orig_mztabs, rdc_mztabs, bestpath_fastas, ref_fasta
+            )
+        }
     }
 }
